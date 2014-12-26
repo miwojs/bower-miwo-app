@@ -1,0 +1,17 @@
+{
+	"name": "miwo-app",
+	"description": "Miwo app component",
+	"version": "0.0.1",
+	"authors": [
+		"Dusan Kmet <morlokdk@gmail.com>"
+	],
+	"main": [
+		"js/miwo-app.js",
+		"js/miwo-app.min.js"
+	],
+	"ignore": [
+	],
+	"dependencies": {
+		"miwo": "latest"
+	}
+}
