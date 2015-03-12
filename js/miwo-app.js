@@ -48,10 +48,16 @@ Application = (function(_super) {
     _ref = this.runControllers;
     for (_i = 0, _len = _ref.length; _i < _len; _i++) {
       name = _ref[_i];
-      this.getController(name).startup();
-    }
-    if (render) {
-      this.render(render);
+      this.getController(name, (function(_this) {
+        return function(controller) {
+          _this.runControllers.erase(controller.name);
+          if (_this.runControllers.length === 0) {
+            if (render) {
+              _this.render(render);
+            }
+          }
+        };
+      })(this));
     }
   };
 
@@ -79,12 +85,17 @@ Application = (function(_super) {
     }
   };
 
-  Application.prototype.getController = function(name) {
-    if (!this.controllers[name]) {
-      this.controllers[name] = this.controllerFactory.create(name);
-      this.controllers[name].application = this;
+  Application.prototype.getController = function(name, onReady) {
+    var controller;
+    controller = this.controllers[name];
+    if (!controller) {
+      controller = this.controllers[name] = this.controllerFactory.create(name);
+      controller.application = this;
+      controller.onStartup(onReady);
+      controller.initialize();
+    } else {
+      controller.onStartup(onReady);
     }
-    return this.controllers[name];
   };
 
   Application.prototype.control = function(target, events) {
@@ -104,24 +115,51 @@ Application = (function(_super) {
   };
 
   Application.prototype.execute = function(request) {
-    this.getController(request.controller).execute(request);
+    this.getController(request.controller, (function(_this) {
+      return function(controller) {
+        controller.execute(request);
+      };
+    })(this));
   };
 
   Application.prototype.forward = function(request) {
-    setTimeout(((function(_this) {
+    miwo.async((function(_this) {
       return function() {
         return _this.execute(request);
       };
-    })(this)), 1);
+    })(this));
   };
 
-  Application.prototype.redirect = function(request) {
-    document.location.hash = this.getRouter().constructHash(request);
+  Application.prototype.redirect = function(request, unique) {
+    if (Type.isString(request) && request.charAt(0) === '#') {
+      request = this.getRouter().constructRequest(request.replace(/^#/, ''));
+    }
+    if (!this.request) {
+      this.redirectRequest(request, unique);
+    } else {
+      this.getController(this.request.controller, (function(_this) {
+        return function(controller) {
+          controller.terminate(_this.request, function() {
+            _this.redirectRequest(request, unique);
+          });
+        };
+      })(this));
+    }
+  };
+
+  Application.prototype.redirectRequest = function(request, unique) {
+    var hash;
+    if (unique) {
+      request.params._rid = Math.random().toString(36).substring(4, 10);
+    }
+    hash = this.getRouter().constructHash(request);
+    this.emit('request', this, request, hash);
+    document.location.hash = hash;
   };
 
   Application.prototype.executeRequestByHash = function() {
     var constructedHash, hash, request;
-    hash = document.location.hash.substr(1).toLowerCase();
+    hash = document.location.hash.substr(1);
     if (!hash && !this.autoCanonicalize) {
       return;
     }
@@ -153,18 +191,15 @@ ContentContainer = (function(_super) {
     return ContentContainer.__super__.constructor.apply(this, arguments);
   }
 
-  ContentContainer.prototype.componentCls = 'miwo-views';
+  ContentContainer.prototype.baseCls = 'miwo-views';
 
   ContentContainer.prototype.role = 'main';
 
+  ContentContainer.prototype.contentEl = 'div';
+
   ContentContainer.prototype.addedComponent = function(component) {
     ContentContainer.__super__.addedComponent.call(this, component);
-    component.el.addClass('miwo-views-item');
-  };
-
-  ContentContainer.prototype.doRender = function() {
-    ContentContainer.__super__.doRender.apply(this, arguments);
-    this.el.setStyle('overflow', 'auto');
+    component.el.addClass(this.getBaseCls('item'));
   };
 
   return ContentContainer;
@@ -211,18 +246,51 @@ Controller = (function(_super) {
   };
 
   Controller.registerView = function(name, klass) {
-    this.prototype['create' + name.capitalize() + 'View'] = function(config) {
+    this.prototype['create' + name.capitalize()] = function(config) {
       return new klass(config);
     };
   };
 
   function Controller(config) {
     Controller.__super__.constructor.call(this, config);
+    this.startuped = false;
+    this.onStartupCallbacks = [];
     this.views = {};
     return;
   }
 
-  Controller.prototype.startup = function() {};
+  Controller.prototype.initialize = function() {
+    this.startup((function(_this) {
+      return function() {
+        miwo.async(function() {
+          var callback, _i, _len, _ref;
+          _this.startuped = true;
+          _ref = _this.onStartupCallbacks;
+          for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+            callback = _ref[_i];
+            callback(_this);
+          }
+          _this.onStartupCallbacks.empty();
+        });
+      };
+    })(this));
+  };
+
+  Controller.prototype.onStartup = function(callback) {
+    if (!this.startuped) {
+      this.onStartupCallbacks.push(callback);
+    } else {
+      miwo.async((function(_this) {
+        return function() {
+          return callback(_this);
+        };
+      })(this));
+    }
+  };
+
+  Controller.prototype.startup = function(done) {
+    done();
+  };
 
   Controller.prototype.beforeRender = function() {};
 
@@ -263,14 +331,31 @@ Controller = (function(_super) {
     })(this);
   };
 
+  Controller.prototype.refresh = function(name) {
+    var renderName, view;
+    if (this.hasView(name)) {
+      view = this.getView(name);
+      renderName = this.formatMethodName(view.request.action, 'render');
+      if (this[renderName]) {
+        this[renderName](view.request, view);
+      }
+    }
+  };
+
   Controller.prototype.forward = function(code, params) {
-    this.request.executed = true;
+    if (this.request) {
+      this.request.executed = true;
+    }
     this.application.forward(this.createRequest(code, params));
   };
 
-  Controller.prototype.redirect = function(code, params) {
-    this.request.executed = true;
-    this.application.redirect(this.createRequest(code, params));
+  Controller.prototype.redirect = function(code, params, unique) {
+    var request;
+    if (this.request) {
+      this.request.executed = true;
+    }
+    request = Type.isString(code) ? this.createRequest(code, params) : code;
+    this.application.redirect(request, unique);
   };
 
   Controller.prototype.createRequest = function(code, params) {
@@ -281,62 +366,95 @@ Controller = (function(_super) {
   };
 
   Controller.prototype.execute = function(request) {
-    var actionName, renderName;
+    var methodName;
     this.request = request;
-    this.view = request.action;
-    actionName = this.formatMethodName(request.action, 'action');
-    if (this[actionName]) {
-      this[actionName](request.params);
+    methodName = this.formatMethodName(request.action, 'show');
+    if (!this[methodName]) {
+      this.executeDone(request);
+      return;
     }
+    this[methodName](request, (function(_this) {
+      return function(view) {
+        _this.executeDone(request, view);
+      };
+    })(this));
+  };
+
+  Controller.prototype.executeDone = function(request, viewName) {
+    var view;
     if (request.executed) {
       return;
     }
-    renderName = this.formatMethodName(this.view, 'render');
-    this.view = this.getView(this.view);
-    this.view.activateView();
-    if (this[renderName]) {
-      this[renderName](request.params);
-    }
     request.executed = true;
-    this.lastRequest = request;
+    if (!viewName) {
+      viewName = request.action;
+    }
+    request.view = viewName;
+    view = this.getView(viewName || request.action);
+    view.request = request;
+    this.application.request = request;
+    this.getViewport().activateView(view.viewName, (function(_this) {
+      return function() {
+        var methodName;
+        methodName = _this.formatMethodName(viewName, 'render');
+        if (_this[methodName]) {
+          _this[methodName](request, view);
+        }
+      };
+    })(this));
+  };
+
+  Controller.prototype.terminate = function(request, callback) {
+    var methodName;
+    methodName = this.formatMethodName(request.view, 'hide');
+    if (!this[methodName]) {
+      miwo.async((function(_this) {
+        return function() {
+          return callback();
+        };
+      })(this));
+      return;
+    }
+    this[methodName](request, this.getView(request.view), (function(_this) {
+      return function() {
+        miwo.async(function() {
+          return callback();
+        });
+      };
+    })(this));
   };
 
   Controller.prototype.getView = function(name) {
     var viewName, viewport;
-    if (name) {
-      viewport = this.getViewport();
-      viewName = this.formatViewName(this.view);
-      if (!viewport.hasView(viewName)) {
-        viewport.addView(viewName, this.createView(this.view));
-      }
-      return viewport.getView(viewName);
-    } else {
-      return this.view;
+    viewport = this.getViewport();
+    viewName = this.formatViewName(name);
+    if (!viewport.hasView(viewName)) {
+      viewport.addView(viewName, this.createView(name));
     }
+    return viewport.getView(viewName);
   };
 
-  Controller.prototype.setView = function(view) {
-    this.view = view;
+  Controller.prototype.hasView = function(name) {
+    var viewName, viewport;
+    viewport = this.getViewport();
+    viewName = this.formatViewName(name);
+    return viewport.hasView(viewName);
   };
 
   Controller.prototype.createView = function(name) {
-    var factory, view, viewport;
-    viewport = this.getViewport();
-    factory = 'create' + name.capitalize() + 'View';
+    var factory, view;
+    factory = 'create' + name.capitalize();
     if (!this[factory]) {
       throw new Error("View " + name + " has no factory method. You must define " + factory + " method in controller " + this);
     }
-    view = this[factory]({
-      isView: true,
-      viewName: this.formatViewName(name),
-      id: this.name + name.capitalize() + 'View'
-    });
+    view = this[factory]();
     if (!(view instanceof Miwo.Component)) {
       throw new Error("Created view should by instance of Miwo.Component");
     }
-    view.activateView = function() {
-      viewport.activateView(this.viewName);
-    };
+    view.isView = true;
+    view.visible = false;
+    view.viewName = this.formatViewName(name);
+    view.setId(this.name + name.capitalize());
     return view;
   };
 
@@ -502,15 +620,16 @@ EventManager = (function(_super) {
   function EventManager() {
     EventManager.__super__.constructor.call(this);
     this.selectors = [];
-    miwo.componentMgr.on("register", this.bound("onRegister"));
-    miwo.componentMgr.on("unregister", this.bound("onUnregister"));
+    miwo.componentMgr.on('register', this.bound('onRegister'));
+    miwo.componentMgr.on('unregister', this.bound('onUnregister'));
     return;
   }
 
   EventManager.prototype.control = function(selector, events) {
     this.selectors.push({
       selector: selector,
-      events: events
+      events: events,
+      parts: selector.split(' ')
     });
   };
 
@@ -519,7 +638,7 @@ EventManager = (function(_super) {
     _ref = this.selectors;
     for (_i = 0, _len = _ref.length; _i < _len; _i++) {
       item = _ref[_i];
-      if (component.is(item.selector)) {
+      if (item.parts.length === 1 && this.isMatched(component, item)) {
         _ref1 = item.events;
         for (name in _ref1) {
           event = _ref1[name];
@@ -527,6 +646,8 @@ EventManager = (function(_super) {
         }
       }
     }
+    component.on('attached', this.bound('onAttached'));
+    component.on('detached', this.bound('onDetached'));
   };
 
   EventManager.prototype.onUnregister = function(component) {
@@ -534,7 +655,7 @@ EventManager = (function(_super) {
     _ref = this.selectors;
     for (_i = 0, _len = _ref.length; _i < _len; _i++) {
       item = _ref[_i];
-      if (component.is(item.selector)) {
+      if (item.parts.length === 1 && this.isMatched(component, item)) {
         _ref1 = item.events;
         for (name in _ref1) {
           event = _ref1[name];
@@ -542,11 +663,87 @@ EventManager = (function(_super) {
         }
       }
     }
+    component.un('attached', this.bound('onAttached'));
+    component.un('detached', this.bound('onDetached'));
+  };
+
+  EventManager.prototype.onAttached = function(component) {
+    var child, event, item, name, _i, _j, _len, _len1, _ref, _ref1, _ref2;
+    _ref = this.selectors;
+    for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+      item = _ref[_i];
+      if (item.parts.length > 1 && this.isMatched(component, item)) {
+        _ref1 = item.events;
+        for (name in _ref1) {
+          event = _ref1[name];
+          component.on(name, event);
+        }
+      }
+    }
+    if (component.isContainer) {
+      _ref2 = component.getComponents().toArray();
+      for (_j = 0, _len1 = _ref2.length; _j < _len1; _j++) {
+        child = _ref2[_j];
+        this.onAttached(child);
+      }
+    }
+  };
+
+  EventManager.prototype.onDetached = function(component) {
+    var child, event, item, name, _i, _j, _len, _len1, _ref, _ref1, _ref2;
+    _ref = this.selectors;
+    for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+      item = _ref[_i];
+      if (item.parts.length > 1 && this.isMatched(component, item)) {
+        _ref1 = item.events;
+        for (name in _ref1) {
+          event = _ref1[name];
+          component.un(name, event);
+        }
+      }
+    }
+    if (component.isContainer) {
+      _ref2 = component.getComponents().toArray();
+      for (_j = 0, _len1 = _ref2.length; _j < _len1; _j++) {
+        child = _ref2[_j];
+        this.onDetached(child);
+      }
+    }
+  };
+
+  EventManager.prototype.isMatched = function(component, item) {
+    var index, indexLast, selector, selectors, _i;
+    if (Type.isString(item)) {
+      selectors = item.split(' ');
+    } else {
+      selectors = item.parts;
+    }
+    if (!component.is(selectors[selectors.length - 1])) {
+      return false;
+    }
+    if (selectors.length === 1) {
+      return true;
+    }
+    component = component.getParent();
+    indexLast = selectors.length - 1;
+    for (index = _i = selectors.length - 1; _i >= 0; index = _i += -1) {
+      selector = selectors[index];
+      if (index === indexLast) {
+        continue;
+      }
+      while (component && !component.is(selector)) {
+        component = component.getParent();
+      }
+      if (component === null) {
+        return false;
+      }
+    }
+    return true;
   };
 
   EventManager.prototype.doDestroy = function() {
-    miwo.componentMgr.un("register", this.bound("onRegister"));
-    miwo.componentMgr.un("unregister", this.bound("onUnregister"));
+    miwo.componentMgr.un('register', this.bound('onRegister'));
+    miwo.componentMgr.un('unregister', this.bound('onUnregister'));
   };
 
   return EventManager;
@@ -606,6 +803,8 @@ Request = (function() {
 
   Request.prototype.action = null;
 
+  Request.prototype.view = null;
+
   Request.prototype.params = null;
 
   function Request(controller, action, params) {
@@ -632,7 +831,7 @@ Request = require('./Request');
 RequestFactory = (function() {
   function RequestFactory() {}
 
-  RequestFactory.prototype.codeRe = /(([a-zA-Z]+)\:)?([a-z][a-zA-Z]+)/;
+  RequestFactory.prototype.codeRe = /^(([a-zA-Z]+)\:)?([a-z][a-zA-Z]+)?$/;
 
   RequestFactory.prototype.create = function(code, params, defaults) {
     var action, controller, parts;
@@ -641,7 +840,7 @@ RequestFactory = (function() {
       throw new Error("Bad redirect CODE");
     }
     controller = parts[2] !== void 0 ? parts[2] : defaults.name;
-    action = parts[3] !== 'this' ? defaults.action : parts[3];
+    action = parts[3] !== 'this' ? parts[3] : defaults.action;
     return new Request(controller, action, params);
   };
 
@@ -675,7 +874,7 @@ Router = (function(_super) {
     match = hash.match(/^(([a-zA-Z]*)(\:([a-z][a-zA-Z]+))?(\?(.*))?)?$/);
     controller = match[2] || this.controller;
     action = match[4] || this.action;
-    params = (match[6] ? match[6].parseQueryString() : {});
+    params = (match[6] ? this.parseQuery(match[6]) : {});
     return new Request(controller, action, params);
   };
 
@@ -692,6 +891,18 @@ Router = (function(_super) {
       }
     }
     return hash;
+  };
+
+  Router.prototype.parseQuery = function(string) {
+    var item, parts, query, _i, _len, _ref;
+    query = {};
+    _ref = string.split('&');
+    for (_i = 0, _len = _ref.length; _i < _len; _i++) {
+      item = _ref[_i];
+      parts = item.split('=');
+      query[decodeURIComponent(parts[0])] = decodeURIComponent(parts[1]);
+    }
+    return query;
   };
 
   return Router;
@@ -721,11 +932,19 @@ Viewport = (function(_super) {
 
   Viewport.prototype.layout = 'absolute';
 
-  Viewport.prototype.componentCls = 'miwo-viewport';
+  Viewport.prototype.baseCls = 'miwo-viewport';
 
   Viewport.prototype.contentEl = 'div';
 
   Viewport.prototype.view = null;
+
+  Viewport.prototype.animation = false;
+
+  Viewport.prototype.animationFxIn = 'fadeIn';
+
+  Viewport.prototype.animationFxOut = 'fadeOut';
+
+  Viewport.prototype.animationDuration = 1000;
 
   Viewport.prototype.afterInit = function() {
     Viewport.__super__.afterInit.apply(this, arguments);
@@ -754,15 +973,59 @@ Viewport = (function(_super) {
     return this.content.add(this.formatName(name), component);
   };
 
-  Viewport.prototype.activateView = function(name) {
-    if (this.view) {
-      this.view.hide();
-      this.view.setActive(false);
+  Viewport.prototype.activateView = function(name, callback) {
+    if (!this.view) {
+      this.view = this.getView(name);
+      this.view.setActive(true);
+      this.view.show();
+      callback();
+      return;
     }
-    this.view = this.getView(name);
-    this.view.show();
-    this.view.setActive(true);
-    return this.view;
+    this.hideView((function(_this) {
+      return function() {
+        _this.view.setActive(false);
+        _this.view = _this.getView(name);
+        _this.showView(function() {
+          _this.view.setActive(true);
+          callback(_this.view);
+        });
+      };
+    })(this));
+  };
+
+  Viewport.prototype.hideView = function(callback) {
+    if (!this.view) {
+      callback();
+    }
+    if (!this.animation) {
+      this.view.hide();
+      callback();
+    } else {
+      this.view.el.addClass('animated').addClass(this.animationFxOut);
+      setTimeout((function(_this) {
+        return function() {
+          _this.view.hide();
+          _this.view.el.removeClass('animated').removeClass(_this.animationFxOut);
+          callback();
+        };
+      })(this), this.animationDuration);
+    }
+  };
+
+  Viewport.prototype.showView = function(callback) {
+    if (!this.animation) {
+      this.view.show();
+      callback();
+    } else {
+      this.view.el.addClass('animated').addClass(this.animationFxIn);
+      this.view.show();
+      callback();
+      setTimeout((function(_this) {
+        return function() {
+          _this.view.el.removeClass('animated').removeClass(_this.animationFxIn);
+        };
+      })(this), this.animationDuration);
+    }
   };
 
   Viewport.prototype.formatName = function(name) {
